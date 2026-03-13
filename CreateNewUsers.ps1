@@ -44,7 +44,7 @@ function Connect-Admin {
 
 function Connect-GraphAdmin {
     try {
-        Connect-MgGraph -Scopes User.ReadWrite.All, Organization.Read.All, Group.ReadWrite.All -NoWelcome
+        Connect-MgGraph -Scopes Application.Read.All, AppRoleAssignment.ReadWrite.All, Directory.Read.All, Group.ReadWrite.All, User.ReadWrite.All, Organization.Read.All -NoWelcome
         Write-Log "Connected to Microsoft Graph." Green
     }
     catch {
@@ -212,7 +212,7 @@ function Assign-License {
 
     $userSynced = $false
     $attempts = 0
-    $maxAttempts = 20
+    $maxAttempts = 60
 
     while (-not $userSynced -and $attempts -lt $maxAttempts) {
         try {
@@ -325,6 +325,42 @@ function Add-UserToVeeamGroup {
     }
 }
 
+function Add-UserToCatoProvisioning {
+    param(
+        [string]$Email,
+        [switch]$WhatIf
+    )
+
+    try {
+        $catoProv = Get-MgServicePrincipal -Filter "displayName eq 'Cato Networks Provisioning'" -ErrorAction Stop
+
+        if (-not $catoProv) {
+            Write-Log "Could not find Cato Networks Provisioning enterprise app." Yellow
+            return
+        }
+
+        $cloudUser = Get-MgUser -UserId $Email -ErrorAction Stop
+
+        $appRoleId = "0b061251-fcae-4fb4-ba47-73c82f6fd290"
+
+        if ($WhatIf) {
+            Write-Log "[WhatIf] Would assign $Email to Cato Networks Provisioning" Yellow
+        }
+        else {
+            New-MgServicePrincipalAppRoleAssignedTo `
+                -ServicePrincipalId $catoProv.Id `
+                -PrincipalId $cloudUser.Id `
+                -ResourceId $catoProv.Id `
+                -AppRoleId $appRoleId | Out-Null
+
+            Write-Log "Added $Email to Cato Networks Provisioning" Green
+        }
+    }
+    catch {
+        Write-Log "Failed to add $Email to Cato Networks Provisioning : $_" Yellow
+    }
+}
+
 # =========================
 # Main
 # =========================
@@ -343,6 +379,6 @@ foreach ($createdUser in $createdUsers) {
     Assign-License -Email $createdUser.Email -WhatIf:$WhatIf
     Add-UserToDistributionGroups -Email $createdUser.Email -Groups $selectedGroups -WhatIf:$WhatIf
     Add-UserToVeeamGroup -Email $createdUser.Email -WhatIf:$WhatIf
+    Add-UserToCatoProvisioning -Email $createdUser.Email -WhatIf:$WhatIf
 }
-
 Write-Log "Onboarding script complete. Log file: $LogFile" Green
