@@ -60,6 +60,7 @@ function Get-SelectedGroups {
         1 = "GT-NY"
         2 = "GW-NY"
         3 = "JA-NY"
+        4 = "SA-NY"
     }
 
     Write-Host ""
@@ -67,9 +68,10 @@ function Get-SelectedGroups {
     Write-Host "1 = GT-NY"
     Write-Host "2 = GW-NY"
     Write-Host "3 = JA-NY"
+    Write-Host "4 = SA-NY"
 
     do {
-        $selection = Read-Host "Enter 1, 2, or 3"
+        $selection = Read-Host "Enter 1, 2, 3 or 4"
     } until ($selection -match '^[1-3]$')
 
     return @($GroupOptions[[int]$selection])
@@ -93,8 +95,22 @@ function Get-AvailableUsername {
             return $candidate
         }
 
+    Write-Host "Username $candidate already exists. Confirm user does not already exist." -ForegroundColor Yellow
+    $response = Read-Host "Type YES to continue or EXIT to cancel"        
+        
+    #preventing duplicate accounts for existing user
+    if ($response.ToLower() -eq "exit") {
+        Write-Log "User creation cancelled by operator." Red
+        throw "User creation cancelled."
+    }
+    elseif ($response.ToLower() -eq "yes") {
         $candidate = "$BaseUsername$counter"
-        $counter++
+        $counter++  
+    }
+    else {
+        Write-Host "Invalid response. Please type YES to continue or EXIT to cancel." -ForegroundColor Yellow
+    }
+      
     }
 }
 
@@ -106,15 +122,18 @@ function AddUsersToAD {
         [switch]$WhatIf
     )
 
+    # Load credentials and user data for AD 
     $cred = Import-Clixml "C:\Users\ksealy\admincred.xml"
-    $users = Import-Csv "C:\Users\ksealy\OneDrive - GOLDEN TOUCH IMPORTS\Desktop\Scripts\NewHire.csv"
+    $users = Import-Csv "C:\Users\ksealy\OneDrive - GOLDEN TOUCH IMPORTS\Desktop\Github\PowershellScripts\NewHire.csv"
 
     $createdUsers = @()
 
     foreach ($user in $users) {
 
-        $firstName   = $user.FirstName
-        $lastName    = $user.LastName
+        # Remove non-ASCII characters from names to avoid AD issues      
+        $firstName = $user.FirstName -replace '[^\x00-\x7F]', ''
+        $lastName  = $user.LastName  -replace '[^\x00-\x7F]', ''
+
         $displayName = "$firstName $lastName"
         $baseUsername = ($user.FirstName[0] + $user.LastName).ToLower()
         $username    = Get-AvailableUsername -BaseUsername $baseUsername -Credential $cred
@@ -364,19 +383,19 @@ function Add-UserToCatoProvisioning {
 # =========================
 # Main
 # =========================
-clear
+
 Write-Log "Starting onboarding script. WhatIf mode = $WhatIf" Cyan
 
 $null = Connect-Admin
 Connect-GraphAdmin
 
-$selectedGroups = Get-SelectedGroups
-Write-Log "Selected distribution group(s): $($selectedGroups -join ', ')" Cyan
 
 $createdUsers = AddUsersToAD -WhatIf:$WhatIf
 
 foreach ($createdUser in $createdUsers) {
     Assign-License -Email $createdUser.Email -WhatIf:$WhatIf
+    $selectedGroups = Get-SelectedGroups
+    Write-Log "Selected distribution group(s): $($selectedGroups -join ', ')" Cyan
     Add-UserToDistributionGroups -Email $createdUser.Email -Groups $selectedGroups -WhatIf:$WhatIf
     Add-UserToVeeamGroup -Email $createdUser.Email -WhatIf:$WhatIf
     Add-UserToCatoProvisioning -Email $createdUser.Email -WhatIf:$WhatIf
