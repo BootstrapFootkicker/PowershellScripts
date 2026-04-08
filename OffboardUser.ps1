@@ -203,6 +203,7 @@ foreach ($user in $users) {
         try {
             Set-MgUserLicense -UserId $graphUser.Id -RemoveLicenses $licensesToRemove -AddLicenses @{} -ErrorAction Stop
             Write-Host "Removed all non-Exchange licenses from user $graphIdentity." -ForegroundColor Green
+            Write-Host "Please verify in the Microsoft 365 admin center that only the Exchange Online license remains assigned to $graphIdentity if applicable." -ForegroundColor Yellow
         }
         catch {
             Write-Host "Failed to remove licenses from user $graphIdentity : $_" -ForegroundColor Red
