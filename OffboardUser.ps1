@@ -79,7 +79,10 @@ function removeUserFromDistributionGroups {
     param(
         [string]$user
     )
+
     try {
+        Write-Host "Checking distribution groups for $user..." -ForegroundColor Cyan
+        $foundGroup = $false
         $groups = Get-DistributionGroup -ResultSize Unlimited
 
         foreach ($group in $groups) {
@@ -90,13 +93,18 @@ function removeUserFromDistributionGroups {
             $members = Get-DistributionGroupMember -Identity $group.Identity -ResultSize Unlimited -ErrorAction SilentlyContinue
 
             if ($members.PrimarySmtpAddress -contains $user) {
+                $foundGroup = $true
                 Remove-DistributionGroupMember -Identity $group.Identity -Member $user -Confirm:$false
                 Write-Host "Removed user $user from distribution group $($group.Name)." -ForegroundColor Green
             }
         }
+
+        if (-not $foundGroup) {
+            Write-Host "User $user is not in any removable distribution groups." -ForegroundColor Yellow
+        }
     }
     catch {
-        Write-Host "Failed to remove user $user from distribution groups: $_" -ForegroundColor Red
+        Write-Host "Failed to check/remove distribution groups for $user : $_" -ForegroundColor Red
     }
 }
 
@@ -105,48 +113,112 @@ function convertToSharedMailbox {
         [string]$userPrincipalName
     )
     try {
-        Set-Mailbox -Identity $userPrincipalName -Type Shared
-        Write-Host "Converted $userPrincipalName to a shared mailbox." -ForegroundColor Green
+        Set-Mailbox -Identity $userPrincipalName -Type Shared -ErrorAction Stop
+       
     }
     catch {
         Write-Host "Failed to convert $userPrincipalName to a shared mailbox: $_" -ForegroundColor Red
     }
 }
  function offboardUser {
-        param (
-            [switch]$csv)
-             $users = Import-Csv "C:\Users\ksealy\OneDrive - GOLDEN TOUCH IMPORTS\Desktop\Github\PowershellScripts\disableUsers.csv"
-            #step 1 disable user in AD
-        disableUserInAD -csv:$csv -users $users
-        #step 2 convert mailbox to shared in Exchange Online
-   foreach ($user in $users) {
-    convertToSharedMailbox -userPrincipalName $user.Username
+    param (
+        [switch]$csv
+    )
 
-    $mailboxStats = Get-EXOMailboxStatistics -Identity $user.Username
-    $mailboxSizeGB = [math]::Round(($mailboxStats.TotalItemSize.Value.ToBytes() / 1GB), 2)
+    $users = Import-Csv "C:\Users\ksealy\OneDrive - GOLDEN TOUCH IMPORTS\Desktop\Github\PowershellScripts\disableUsers.csv"
 
-    if ($mailboxSizeGB -ge 50) {
+    # step 1 disable user in AD
+    disableUserInAD -csv:$csv -users $users
+
+    $cred = Import-Clixml "C:\Users\ksealy\admincred.xml"
+
+    foreach ($user in $users) {
+
+        $adUser = Get-ADUser -Identity $user.Username -Credential $cred -Properties UserPrincipalName,mail -ErrorAction SilentlyContinue
+
+        if ($adUser -eq $null) {
+            Write-Host "Could not find AD user for $($user.Username), skipping Exchange and distribution group steps." -ForegroundColor Red
+            continue
+        }
+
+        $exchangeIdentity = if ($adUser.mail) { $adUser.mail } else { $adUser.UserPrincipalName }
+
+        # step 2 convert mailbox to shared in Exchange Online
+        convertToSharedMailbox -userPrincipalName $exchangeIdentity
+
+        $mailboxStats = Get-EXOMailboxStatistics -Identity $exchangeIdentity -ErrorAction SilentlyContinue
+
+        if ($mailboxStats) {
+            $mailboxSizeGB = [math]::Round(($mailboxStats.TotalItemSize.Value.ToBytes() / 1GB), 2)
+
+            if ($mailboxSizeGB -ge 50) {
+                try {
+                    Write-Host "Mailbox for $exchangeIdentity is $mailboxSizeGB GB. Assign Exchange Online license here." -ForegroundColor Yellow
+                }
+                catch {
+                    Write-Host "You are out of Exchange Online licenses. Please purchase or reallocate more." -ForegroundColor Red
+                }
+            }
+        }
+        else {
+            Write-Host "Could not get mailbox statistics for $exchangeIdentity." -ForegroundColor Red
+        }
+
+        # step 3 remove user from distribution groups
+       removeUserFromDistributionGroups -user $exchangeIdentity
+    }
+
+
+# step 4 remove all licenses except Exchange Online if assigned
+$exchangeSkuId = "19ec0d23-8335-4cbd-94ac-6050e30712fa"
+
+foreach ($user in $users) {
+
+    $adUser = Get-ADUser -Identity $user.Username -Credential $cred -Properties UserPrincipalName,mail -ErrorAction SilentlyContinue
+
+    if ($adUser -eq $null) {
+        Write-Host "Could not find AD user for $($user.Username), skipping license removal." -ForegroundColor Red
+        continue
+    }
+
+    $graphIdentity = if ($adUser.mail) { $adUser.mail } else { $adUser.UserPrincipalName }
+
+    $graphUser = Get-MgUser -UserId $graphIdentity -Property Id,DisplayName,UserPrincipalName,AssignedLicenses -ErrorAction SilentlyContinue
+
+    if ($graphUser) {
+        $assignedSkuIds = @($graphUser.AssignedLicenses | Select-Object -ExpandProperty SkuId)
+
+        if (-not $assignedSkuIds -or $assignedSkuIds.Count -eq 0) {
+            Write-Host "No licenses assigned to user $graphIdentity." -ForegroundColor Yellow
+            continue
+        }
+
+        $licensesToRemove = $assignedSkuIds | Where-Object { $_ -ne $exchangeSkuId }
+
+        if (-not $licensesToRemove -or $licensesToRemove.Count -eq 0) {
+            Write-Host "No non-Exchange licenses to remove for $graphIdentity." -ForegroundColor Yellow
+            continue
+        }
+
         try {
-            Write-Host "Mailbox for $($user.Username) is $mailboxSizeGB GB. Assign Exchange Online license here." -ForegroundColor Yellow
+            Set-MgUserLicense -UserId $graphUser.Id -RemoveLicenses $licensesToRemove -AddLicenses @{} -ErrorAction Stop
+            Write-Host "Removed all non-Exchange licenses from user $graphIdentity." -ForegroundColor Green
         }
         catch {
-            Write-Host "You are out of Exchange Online licenses. Please purchase or reallocate more." -ForegroundColor Red
+            Write-Host "Failed to remove licenses from user $graphIdentity : $_" -ForegroundColor Red
         }
     }
-}
-            #step 3 remove user from distribution groups
-            foreach ($user in $users) {
-                removeUserFromDistributionGroups -user $user.Username
-            }
-            #step 4 remind user to delete plm and as400 accounts
-            Write-Host "Please remember to delete the PLM and AS400 accounts for the offboarded users." -ForegroundColor Yellow
-
+    else {
+        Write-Host "Could not find user $graphIdentity in Microsoft Graph." -ForegroundColor Red
     }
+}
+    # step 5 remind user to delete plm and as400 accounts
+    Write-Host "Please remember to delete the PLM and AS400 accounts for the offboarded users." -ForegroundColor Yellow
+}
 cls
 $null = Connect-Admin
 Connect-GraphAdmin
 
 offboardUser -csv
-
 
 
