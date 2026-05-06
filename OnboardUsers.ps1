@@ -70,22 +70,43 @@ function Connect-GraphAdmin {
 # =========================
 function Get-SelectedGroups {
     $GroupOptions = @{
-        1 = "GT-NY"
-        2 = "GW-NY"
-        3 = "JA-NY"
-        4 = "SA-NY"
+        1  = "GT-NY"
+        2  = "GT-NJ"
+        3  = "GT-PA"
+        4  = "GT-AK"
+        5  = "GT-Remote"
+        6  = "GW-NY"
+        7  = "GW-NJ"
+        8  = "GW-Remote"
+        9  = "TOP-NY"
+        10 = "TOP-NJ"
+        11 = "TOP-AK"
+        12 = "TOP-Remote"
+        13 = "SA-NY"
+        14 = "SA-NJ"
+        15 = "SA-Remote"
+        16 = "JA-NY"
+        17 = "JA-NJ"
+        18 = "JA-Remote"
+        19 = "RL-NJ"
+        20 = "RL-PA"
+        21 = "RL-CA"
+        22 = "RL-Remote"
     }
 
     Write-Host ""
     Write-Host "Choose a distribution group for this run:" -ForegroundColor Cyan
-    Write-Host "1 = GT-NY"
-    Write-Host "2 = GW-NY"
-    Write-Host "3 = JA-NY"
-    Write-Host "4 = SA-NY"
+
+    foreach ($key in ($GroupOptions.Keys | Sort-Object)) {
+        Write-Host "$key = $($GroupOptions[$key])"
+    }
 
     do {
-        $selection = Read-Host "Enter 1, 2, 3 or 4"
-    } until ($selection -match '^[1-4]$')
+        $selection = Read-Host "Enter a number from 1 to 22"
+    } until (
+        $selection -match '^\d+$' -and
+        $GroupOptions.ContainsKey([int]$selection)
+    )
 
     return @($GroupOptions[[int]$selection])
 }
