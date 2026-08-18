@@ -175,12 +175,12 @@ function AddUsersToAD {
 }
 
         # Remove non-ASCII characters from names to avoid AD issues      
-      $firstName = ($user.FirstName -replace '[^\x00-\x7F]', '') -replace '\s+', ''
-      $lastName  = ($user.LastName  -replace '[^\x00-\x7F]', '') -replace '\s+', ''   
+       $firstName = ($user.FirstName -replace '[^\x00-\x7F]', '') -replace '\s+', ''
+       $lastName  = ($user.LastName  -replace '[^\x00-\x7F]', '') -replace '\s+', ''   
 
         $displayName = "$firstName $lastName"
-        $baseUsername = ($user.FirstName[0] + $user.LastName).ToLower()
-        $alternateUsername = (($user.FirstName + $user.LastName) -replace '\s', '').ToLower()
+        $baseUsername = ($firstName[0] + $lastName).ToLower()
+        $alternateUsername = ($firstName + $lastName).ToLower()
         $username    = Get-AvailableUsername -BaseUsername $baseUsername -AlternateUsername $alternateUsername -Credential $cred
         $email       = "$username@$($user.Email)"
         $jobTitle    = $user.JobTitle
@@ -290,27 +290,10 @@ function Assign-License {
 
     Write-Log "Waiting for Azure sync for $Email..." Cyan
 
-    $userSynced = $false
-    $attempts = 0
-    $maxAttempts = 60
-
-    while (-not $userSynced -and $attempts -lt $maxAttempts) {
-        try {
-            $null = Get-MgUser -UserId $Email -ErrorAction Stop
-            $userSynced = $true
-            Write-Log "User synced to Azure." Green
-        }
-        catch {
-            Write-Log "User not synced yet... waiting 30 seconds." Yellow
-            Start-Sleep -Seconds 30
-            $attempts++
-        }
-    }
-
-    if (-not $userSynced) {
-        Write-Log "User never synced. Aborting license assignment." Red
-        return
-    }
+    $syncStatus = isSynced -Email $Email
+    
+if ($syncStatus -eq $true) {
+    
 
     try {
         if ($WhatIf) {
@@ -338,6 +321,72 @@ function Assign-License {
         Write-Log "Failed assigning license to $Email : $_" Red
     }
 }
+else {
+    Write-Log "Never synced...aborting"
+}
+}
+
+
+#azure sync
+function isSynced {
+    param(
+        [string]$Email
+    )
+
+    $userSynced = $false
+    $attempts = 0
+    $maxAttempts = 60
+
+    while (-not $userSynced -and $attempts -lt $maxAttempts) {
+        try {
+            $null = Get-MgUser -UserId $Email -ErrorAction Stop
+            $userSynced = $true
+            Write-Log "$Email synced to Azure." Green
+        }
+        catch {
+            $attempts++
+            Write-Log "$Email not synced yet... waiting 30 seconds. ($attempts/$maxAttempts)" Yellow
+            Start-Sleep -Seconds 30
+        }
+    }
+
+    if (-not $userSynced) {
+        Write-Log "$Email never synced to Azure." Red
+        return $false
+    }
+
+    return $true
+}
+
+function Test-ExchangeSync {
+    param(
+        [string]$Email
+    )
+
+    $attempts = 0
+    $maxAttempts = 40
+
+    while ($attempts -lt $maxAttempts) {
+        try {
+            Get-Recipient `
+                -Identity $Email `
+                -ErrorAction Stop |
+                Out-Null
+
+            Write-Log "$Email is now available in Exchange." Green
+            return $true
+        }
+        catch {
+            $attempts++
+
+            Write-Log "User not available in Exchange yet... waiting 15 seconds. ($attempts/$maxAttempts)" Yellow
+            Start-Sleep -Seconds 15
+        }
+    }
+
+    Write-Log "$Email never became available in Exchange." Red
+    return $false
+}
 
 # =========================
 # Distribution groups
@@ -349,6 +398,15 @@ function Add-UserToDistributionGroups {
         [switch]$WhatIf
     )
 
+    Write-Log "Waiting for $Email to become available in Exchange..." Cyan
+
+    $syncStatus = Test-ExchangeSync -Email $Email
+
+    if (-not $syncStatus) {
+        Write-Log "User never became available in Exchange. Aborting distribution group assignment." Red
+        return
+    }
+
     foreach ($group in $Groups) {
         try {
             if ($WhatIf) {
@@ -358,7 +416,8 @@ function Add-UserToDistributionGroups {
                 Add-DistributionGroupMember `
                     -Identity $group `
                     -Member $Email `
-                    -ErrorAction Stop | Out-Null
+                    -ErrorAction Stop |
+                    Out-Null
 
                 Write-Log "Added $Email to distribution group $group" Green
             }
