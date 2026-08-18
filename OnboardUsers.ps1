@@ -117,11 +117,12 @@ function Get-SelectedGroups {
 function Get-AvailableUsername {
     param(
         [string]$BaseUsername,
+        [string]$AlternateUsername,
         [pscredential]$Credential
     )
 
     $candidate = $BaseUsername
-    $counter = 2
+    #$counter = 2
 
     while ($true) {
         $existingUser = Get-ADUser -Filter "SamAccountName -eq '$candidate'" -Credential $Credential -ErrorAction SilentlyContinue
@@ -138,8 +139,8 @@ function Get-AvailableUsername {
         throw "User creation cancelled."
     }
     elseif ($response.ToLower() -eq "yes") {
-        $candidate = "$BaseUsername$counter"
-        $counter++  
+        $candidate = $AlternateUsername
+       # $counter++  
     }
     else {
         Write-Host "Invalid response. Please type YES to continue or EXIT to cancel." -ForegroundColor Yellow
@@ -174,19 +175,36 @@ function AddUsersToAD {
 }
 
         # Remove non-ASCII characters from names to avoid AD issues      
-        $firstName = $user.FirstName -replace '[^\x00-\x7F]', ''
-        $lastName  = $user.LastName  -replace '[^\x00-\x7F]', ''
+      $firstName = ($user.FirstName -replace '[^\x00-\x7F]', '') -replace '\s+', ''
+      $lastName  = ($user.LastName  -replace '[^\x00-\x7F]', '') -replace '\s+', ''   
 
         $displayName = "$firstName $lastName"
         $baseUsername = ($user.FirstName[0] + $user.LastName).ToLower()
-        $username    = Get-AvailableUsername -BaseUsername $baseUsername -Credential $cred
+        $alternateUsername = (($user.FirstName + $user.LastName) -replace '\s', '').ToLower()
+        $username    = Get-AvailableUsername -BaseUsername $baseUsername -AlternateUsername $alternateUsername -Credential $cred
         $email       = "$username@$($user.Email)"
         $jobTitle    = $user.JobTitle
         $department  = $user.Department
         $description = "Start Date: $($user.Description)"
 
-        $manager = Get-ADUser -Identity $user.Manager -Credential $cred
+        $managerIdentity = $user.Manager
 
+while ($true) {
+    try {
+        $manager = Get-ADUser `
+            -Identity $managerIdentity `
+            -Credential $cred `
+            -ErrorAction Stop
+
+        Write-Log "Manager found: $($manager.Name)" Green
+        break
+    }
+    catch {
+        Write-Log "Manager '$managerIdentity' does not exist or could not be found." Yellow
+
+        $managerIdentity = Read-Host "Enter the correct manager username"
+    }
+}
         $templateUser = Get-ADUser -Identity $user.TemplateUser `
             -Credential $cred `
             -Properties MemberOf, DistinguishedName
