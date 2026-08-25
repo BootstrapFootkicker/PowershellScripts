@@ -42,33 +42,42 @@ function Connect-Admin {
     param(
         $adminEmail
     )
-    while ($true) {
-       # $adminEmail = Read-Host "Enter your admin email for authentication"
+    $attempts = 0
+    while ($attempts -lt 5) {
         try {
-            Connect-ExchangeOnline -UserPrincipalName $adminEmail -ShowProgress $true -ErrorAction Stop
+            Connect-ExchangeOnline -UserPrincipalName $adminEmail -Device -ShowProgress $true -ErrorAction Stop
             Write-Log "Successfully connected to Exchange as $adminEmail" Green
             return $adminEmail
         }
         catch {
-            Write-Log "Failed to connect to Exchange. Please check your email and try again." Red
+            $attempts++
+            Write-Log "Failed to connect to Exchange (attempt $attempts/5): $($_.Exception.Message)" Red
+            Start-Sleep -Seconds 2
         }
     }
+    throw "Could not connect to Exchange after 5 attempts."
 }
 
 function Connect-GraphAdmin {
     try {
-        Connect-MgGraph -Scopes Application.Read.All, AppRoleAssignment.ReadWrite.All, Directory.Read.All, Group.ReadWrite.All, User.ReadWrite.All, Organization.Read.All -NoWelcome
+        Connect-MgGraph -Scopes Application.Read.All, AppRoleAssignment.ReadWrite.All, Directory.Read.All, Group.ReadWrite.All, User.ReadWrite.All, Organization.Read.All -NoWelcome -ErrorAction Stop
         Write-Log "Connected to Microsoft Graph." Green
     }
     catch {
         Write-Log "Failed to connect to Microsoft Graph: $_" Red
+        exit 1 #exits script if connection fails
     }
 }
 
 # =========================
 # Group selection (ask once)
 # =========================
-function Get-SelectedGroups {
+function Get-SelectedGroups 
+{
+    param(
+        [string]$username
+        )
+
     $GroupOptions = @{
         1  = "GT-NY"
         2  = "GT-NJ"
@@ -95,7 +104,7 @@ function Get-SelectedGroups {
     }
 
     Write-Host ""
-    Write-Host "Choose a distribution group for this run:" -ForegroundColor Cyan
+    Write-Host "Choose a distribution group for ${username}:" -ForegroundColor Cyan
 
     foreach ($key in ($GroupOptions.Keys | Sort-Object)) {
         Write-Host "$key = $($GroupOptions[$key])"
@@ -186,6 +195,7 @@ function AddUsersToAD {
         $jobTitle    = $user.JobTitle
         $department  = $user.Department
         $description = "Start Date: $($user.Description)"
+        $distGroup = Get-SelectedGroups -username $username
 
         $managerIdentity = $user.Manager
 
@@ -273,10 +283,104 @@ while ($true) {
         $createdUsers += [PSCustomObject]@{
             Username = $username
             Email    = $email
+            distGroup = $distGroup
         }
     }
 
     return $createdUsers
+}
+
+# =========================
+# Batched sync checks (check ALL users at once instead of one-by-one)
+# =========================
+function Wait-ForAzureSyncBatch {
+    param(
+        [array]$Emails
+    )
+
+    $pending = [System.Collections.Generic.List[string]]::new()
+    $pending.AddRange([string[]]$Emails)
+
+    $synced = @{}
+    $attempts = 0
+    $maxAttempts = 30   # 30 x 30s = 15 min ceiling
+
+    Write-Log "Waiting for Azure sync for $($pending.Count) user(s): $($pending -join ', ')" Cyan
+
+    while ($pending.Count -gt 0 -and $attempts -lt $maxAttempts) {
+        $stillPending = [System.Collections.Generic.List[string]]::new()
+
+        foreach ($email in $pending) {
+            try {
+                $null = Get-MgUser -UserId $email -ErrorAction Stop
+                $synced[$email] = $true
+                Write-Log "$email synced to Azure." Green
+            }
+            catch {
+                $stillPending.Add($email)
+            }
+        }
+
+        $pending = $stillPending
+
+        if ($pending.Count -gt 0) {
+            $attempts++
+            Write-Log "$($pending.Count) user(s) still not synced to Azure (attempt $attempts/$maxAttempts): $($pending -join ', ')" Yellow
+            Start-Sleep -Seconds 30
+        }
+    }
+
+    foreach ($email in $pending) {
+        Write-Log "$email never synced to Azure within timeout." Red
+        $synced[$email] = $false
+    }
+
+    return $synced
+}
+
+function Wait-ForExchangeSyncBatch {
+    param(
+        [array]$Emails
+    )
+
+    $pending = [System.Collections.Generic.List[string]]::new()
+    $pending.AddRange([string[]]$Emails)
+
+    $synced = @{}
+    $attempts = 0
+    $maxAttempts = 80   # 80 x 15s = 20 min ceiling (was 30 = 7.5 min)
+
+    Write-Log "Waiting for Exchange sync for $($pending.Count) user(s): $($pending -join ', ')" Cyan
+
+    while ($pending.Count -gt 0 -and $attempts -lt $maxAttempts) {
+        $stillPending = [System.Collections.Generic.List[string]]::new()
+
+        foreach ($email in $pending) {
+            try {
+                Get-Recipient -Identity $email -ErrorAction Stop | Out-Null
+                $synced[$email] = $true
+                Write-Log "$email is now available in Exchange." Green
+            }
+            catch {
+                $stillPending.Add($email)
+            }
+        }
+
+        $pending = $stillPending
+
+        if ($pending.Count -gt 0) {
+            $attempts++
+            Write-Log "$($pending.Count) user(s) still not in Exchange (attempt $attempts/$maxAttempts): $($pending -join ', ')" Yellow
+            Start-Sleep -Seconds 15
+        }
+    }
+
+    foreach ($email in $pending) {
+        Write-Log "$email never became available in Exchange within timeout." Red
+        $synced[$email] = $false
+    }
+
+    return $synced
 }
 
 # =========================
@@ -287,13 +391,6 @@ function Assign-License {
         [string]$Email,
         [switch]$WhatIf
     )
-
-    Write-Log "Waiting for Azure sync for $Email..." Cyan
-
-    $syncStatus = isSynced -Email $Email
-    
-if ($syncStatus -eq $true) {
-    
 
     try {
         if ($WhatIf) {
@@ -321,72 +418,6 @@ if ($syncStatus -eq $true) {
         Write-Log "Failed assigning license to $Email : $_" Red
     }
 }
-else {
-    Write-Log "Never synced...aborting"
-}
-}
-
-
-#azure sync
-function isSynced {
-    param(
-        [string]$Email
-    )
-
-    $userSynced = $false
-    $attempts = 0
-    $maxAttempts = 60
-
-    while (-not $userSynced -and $attempts -lt $maxAttempts) {
-        try {
-            $null = Get-MgUser -UserId $Email -ErrorAction Stop
-            $userSynced = $true
-            Write-Log "$Email synced to Azure." Green
-        }
-        catch {
-            $attempts++
-            Write-Log "$Email not synced yet... waiting 30 seconds. ($attempts/$maxAttempts)" Yellow
-            Start-Sleep -Seconds 30
-        }
-    }
-
-    if (-not $userSynced) {
-        Write-Log "$Email never synced to Azure." Red
-        return $false
-    }
-
-    return $true
-}
-
-function Test-ExchangeSync {
-    param(
-        [string]$Email
-    )
-
-    $attempts = 0
-    $maxAttempts = 40
-
-    while ($attempts -lt $maxAttempts) {
-        try {
-            Get-Recipient `
-                -Identity $Email `
-                -ErrorAction Stop |
-                Out-Null
-
-            Write-Log "$Email is now available in Exchange." Green
-            return $true
-        }
-        catch {
-            $attempts++
-
-            Write-Log "User not available in Exchange yet... waiting 15 seconds. ($attempts/$maxAttempts)" Yellow
-            Start-Sleep -Seconds 15
-        }
-    }
-
-    Write-Log "$Email never became available in Exchange." Red
-    return $false
-}
 
 # =========================
 # Distribution groups
@@ -398,29 +429,15 @@ function Add-UserToDistributionGroups {
         [switch]$WhatIf
     )
 
-    Write-Log "Waiting for $Email to become available in Exchange..." Cyan
-
-    $syncStatus = Test-ExchangeSync -Email $Email
-
-    if (-not $syncStatus) {
-        Write-Log "User never became available in Exchange. Aborting distribution group assignment." Red
-        return
-    }
-
     foreach ($group in $Groups) {
         try {
-            if ($WhatIf) {
-                Write-Log "[WhatIf] Would add $Email to distribution group $group" Yellow
-            }
-            else {
-                Add-DistributionGroupMember `
-                    -Identity $group `
-                    -Member $Email `
-                    -ErrorAction Stop |
-                    Out-Null
+            Add-DistributionGroupMember `
+                -Identity $group `
+                -Member $Email `
+                -ErrorAction Stop |
+                Out-Null
 
-                Write-Log "Added $Email to distribution group $group" Green
-            }
+            Write-Log "Added $Email to distribution group $group" Green
         }
         catch {
             Write-Log "Failed to add $Email to distribution group $group : $_" Yellow
@@ -559,35 +576,32 @@ function Initialize-Script {
 }
 
 
-    Write-Log "Selected distribution group(s): $($selectedGroups -join ', ')" Cyan
-
-# =========================
-# Main
-# =========================
-
-Write-Log "Starting onboarding script. WhatIf mode = $WhatIf" Cyan
-
-Initialize-Script -ScriptRoot $ScriptRoot
-
-$config = Get-Content $ConfigFile | ConvertFrom-Json
-$adminEmail = $config.AdminEmail
-
-Connect-Admin -adminEmail $adminEmail
-Connect-GraphAdmin
-
 
 
 $createdUsers = AddUsersToAD -WhatIf:$WhatIf
 
-foreach ($createdUser in $createdUsers) {
-     Write-Log "Processing post-creation tasks for $($createdUser.Email)" Cyan
-$selectedGroups = Get-SelectedGroups
-Write-Log "Selected distribution group(s): $($selectedGroups -join ', ')" Cyan
+# Wait ONCE for the whole batch instead of per-user
+$azureSyncResults = Wait-ForAzureSyncBatch -Emails ($createdUsers | ForEach-Object { $_.Email })
+$exchangeSyncResults = Wait-ForExchangeSyncBatch -Emails ($createdUsers | ForEach-Object { $_.Email })
 
-    Assign-License -Email $createdUser.Email -WhatIf:$WhatIf
-    Add-UserToDistributionGroups -Email $createdUser.Email -Groups $selectedGroups -WhatIf:$WhatIf
-    Add-UserToVeeamGroup -Email $createdUser.Email -WhatIf:$WhatIf
-    Add-UserToCatoProvisioning -Email $createdUser.Email -WhatIf:$WhatIf
+foreach ($createdUser in $createdUsers) {
+    Write-Log "Processing post-creation tasks for $($createdUser.Email)" Cyan
+
+    if ($azureSyncResults[$createdUser.Email]) {
+        Assign-License -Email $createdUser.Email -WhatIf:$WhatIf
+        Add-UserToVeeamGroup -Email $createdUser.Email -WhatIf:$WhatIf
+        Add-UserToCatoProvisioning -Email $createdUser.Email -WhatIf:$WhatIf
+    }
+    else {
+        Write-Log "Skipping license/Graph group tasks for $($createdUser.Email) — never synced to Azure." Red
+    }
+
+    if ($exchangeSyncResults[$createdUser.Email]) {
+        Add-UserToDistributionGroups -Email $createdUser.Email -Groups $createdUser.distGroup -WhatIf:$WhatIf
+    }
+    else {
+        Write-Log "Skipping distribution group assignment for $($createdUser.Email) — never became available in Exchange." Red
+    }
 }
 
 Write-Log "Onboarding script complete. Log file: $LogFile" Green
